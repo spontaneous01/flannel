@@ -26,6 +26,8 @@ import (
 	"github.com/vishvananda/netlink"
 	"golang.org/x/net/context"
 
+	"syscall"
+
 	"github.com/coreos/flannel/backend"
 	"github.com/coreos/flannel/pkg/ip"
 	"github.com/coreos/flannel/subnet"
@@ -35,7 +37,6 @@ type network struct {
 	backend.SimpleNetwork
 	extIface  *backend.ExternalInterface
 	dev       *vxlanDevice
-	routes    routes
 	subnetMgr subnet.Manager
 }
 
@@ -53,12 +54,6 @@ func newNetwork(subnetMgr subnet.Manager, extIface *backend.ExternalInterface, d
 }
 
 func (nw *network) Run(ctx context.Context) {
-	log.V(0).Info("Watching for L3 misses")
-	misses := make(chan *netlink.Neigh, 100)
-	// Unfortunately MonitorMisses does not take a cancel channel
-	// as there's no wait to interrupt netlink socket recv
-	go nw.dev.MonitorMisses(misses)
-
 	wg := sync.WaitGroup{}
 
 	log.V(0).Info("Watching for new subnet leases")
@@ -89,9 +84,6 @@ func (nw *network) Run(ctx context.Context) {
 
 	for {
 		select {
-		case miss := <-misses:
-			nw.handleMiss(miss)
-
 		case evtBatch := <-events:
 			nw.handleSubnetEvents(evtBatch)
 
@@ -125,8 +117,22 @@ func (nw *network) handleSubnetEvents(batch []subnet.Event) {
 				log.Error("Error decoding subnet lease JSON: ", err)
 				continue
 			}
-			nw.routes.set(event.Lease.Subnet, net.HardwareAddr(attrs.VtepMAC))
-			nw.dev.AddL2(neighbor{IP: event.Lease.Attrs.PublicIP, MAC: net.HardwareAddr(attrs.VtepMAC)})
+			//TODO - actually set the route
+			//nw.dev.AddL3(neighbor{IP: ip.FromIP(miss.IP), MAC: route.vtepMAC}); err != nil {
+			route := netlink.Route{
+				LinkIndex: nw.dev.link.Attrs().Index,
+				Scope:     netlink.SCOPE_UNIVERSE,
+				Dst:       event.Lease.Subnet.ToIPNet(),
+				Gw:        event.Lease.Subnet.IP.ToIP(),
+			}
+
+			log.V(1).Info("GW used: ", event.Lease.Subnet.IP.ToIP())
+			if err := netlink.RouteAdd(&route); err != nil && err != syscall.EEXIST {
+				panic(fmt.Errorf("failed to add route (%s -> %s): %v", route.Dst, route.Gw, err))
+			}
+
+			//nw.dev.AddFdb(neighbor{IP: event.Lease.Attrs.PublicIP, MAC: net.HardwareAddr(attrs.VtepMAC)})
+			//TODO - actually set the route
 
 		case subnet.EventRemoved:
 			log.V(1).Info("Subnet removed: ", event.Lease.Subnet)
@@ -143,9 +149,8 @@ func (nw *network) handleSubnetEvents(batch []subnet.Event) {
 			}
 
 			if len(attrs.VtepMAC) > 0 {
-				nw.dev.DelL2(neighbor{IP: event.Lease.Attrs.PublicIP, MAC: net.HardwareAddr(attrs.VtepMAC)})
+				nw.dev.DelFdb(neighbor{IP: event.Lease.Attrs.PublicIP, MAC: net.HardwareAddr(attrs.VtepMAC)})
 			}
-			nw.routes.remove(event.Lease.Subnet)
 
 		default:
 			log.Error("Internal error: unknown event type: ", int(event.Type))
@@ -154,10 +159,14 @@ func (nw *network) handleSubnetEvents(batch []subnet.Event) {
 }
 
 func (nw *network) handleInitialSubnetEvents(batch []subnet.Event) error {
+	// The goal of this function is the ensure that the FDB (the mappings of VTEPs to public IPs) matches what's in
+	// the datastore.
+	// It does this by fetching the FDB, deleting ones that shouldn't be there then adding ones that should be.
+
 	log.V(1).Infof("Handling initial subnet events")
-	fdbTable, err := nw.dev.GetL2List()
+	fdbTable, err := nw.dev.GetFdbTable()
 	if err != nil {
-		return fmt.Errorf("error fetching L2 table: %v", err)
+		return fmt.Errorf("error fetching FDB table: %v", err)
 	}
 
 	// Log the existing VTEP -> Public IP mappings
@@ -165,9 +174,30 @@ func (nw *network) handleInitialSubnetEvents(batch []subnet.Event) error {
 		log.V(1).Infof("fdb already populated with: %s %s ", fdbEntry.IP, fdbEntry.HardwareAddr)
 	}
 
+	arpTable, err := nw.dev.GetArpTable()
+	if err != nil {
+		return fmt.Errorf("error fetching ARP table: %v", err)
+	}
+
+	for _, arpEntry := range arpTable {
+		log.V(1).Infof("arp table already populated with: %s %s ", arpEntry.IP, arpEntry.HardwareAddr)
+	}
+
+	routeTable, err := nw.dev.GetRouteTable()
+	if err != nil {
+		return fmt.Errorf("error fetching route table: %v", err)
+	}
+	for _, routeEntry := range routeTable {
+		log.V(1).Infof("route table already populated with: %s nh %s ", routeEntry.Dst, routeEntry.Gw)
+	}
+
+	log.V(1).Infof("Finished fetching initial state")
+	panic(0)
 	// "marked" events are skipped at the end.
 	eventMarker := make([]bool, len(batch))
 	leaseAttrsList := make([]vxlanLeaseAttrs, len(batch))
+
+	// "marked" fdbEntries are ones that do NOT get deleted at the end
 	fdbEntryMarker := make([]bool, len(fdbTable))
 
 	// Run through the events "marking" ones that should be skipped
@@ -195,15 +225,33 @@ func (nw *network) handleInitialSubnetEvents(batch []subnet.Event) error {
 			}
 		}
 
-		// Store off the subnet lease and VTEP
-		nw.routes.set(evt.Lease.Subnet, net.HardwareAddr(leaseAttrsList[eventMarkerIndex].VtepMAC))
+		err := nw.dev.AddFdb(neighbor{IP: evt.Lease.Subnet.IP, MAC: net.HardwareAddr(leaseAttrsList[eventMarkerIndex].VtepMAC)})
+		if err != nil {
+			log.Error("Add L3 failed: ", err)
+		}
+
+		// Set the route - the kernel would ARP for the Gw IP address if it hadn't already been set above.
 		log.V(2).Infof("Adding subnet: %s PublicIP: %s VtepMAC: %s", evt.Lease.Subnet, evt.Lease.Attrs.PublicIP, net.HardwareAddr(leaseAttrsList[eventMarkerIndex].VtepMAC))
+
+		route := netlink.Route{
+			LinkIndex: nw.dev.link.Attrs().Index,
+			Scope:     netlink.SCOPE_UNIVERSE,
+			Dst:       evt.Lease.Subnet.ToIPNet(),
+			Gw:        evt.Lease.Subnet.IP.ToIP(),
+		}
+		route.SetFlag(syscall.RTNH_F_ONLINK)
+
+		log.V(1).Info("GW used: ", evt.Lease.Subnet.IP.ToIP())
+		if err := netlink.RouteAdd(&route); err != nil && err != syscall.EEXIST {
+			panic(fmt.Errorf("failed to add route (%s -> %s): %v", route.Dst, route.Gw, err))
+		}
+		log.V(1).Info("Done")
 	}
 
 	// Loop over the existing FDB entries, deleting any that shouldn't be there
 	for j, marker := range fdbEntryMarker {
 		if !marker && fdbTable[j].IP != nil {
-			err := nw.dev.DelL2(neighbor{IP: ip.FromIP(fdbTable[j].IP), MAC: fdbTable[j].HardwareAddr})
+			err := nw.dev.DelFdb(neighbor{IP: ip.FromIP(fdbTable[j].IP), MAC: fdbTable[j].HardwareAddr})
 			if err != nil {
 				log.Error("Delete L2 failed: ", err)
 			}
@@ -213,38 +261,11 @@ func (nw *network) handleInitialSubnetEvents(batch []subnet.Event) error {
 	// Loop over the events (skipping marked ones), adding them to the FDB table.
 	for i, marker := range eventMarker {
 		if !marker {
-			err := nw.dev.AddL2(neighbor{IP: batch[i].Lease.Attrs.PublicIP, MAC: net.HardwareAddr(leaseAttrsList[i].VtepMAC)})
+			err := nw.dev.AddFdb(neighbor{IP: batch[i].Lease.Attrs.PublicIP, MAC: net.HardwareAddr(leaseAttrsList[i].VtepMAC)})
 			if err != nil {
 				log.Error("Add L2 failed: ", err)
 			}
 		}
 	}
 	return nil
-}
-
-func (nw *network) handleMiss(miss *netlink.Neigh) {
-	switch {
-	case len(miss.IP) == 0 && len(miss.HardwareAddr) == 0:
-		log.V(2).Info("Ignoring nil miss")
-
-	case len(miss.HardwareAddr) == 0:
-		nw.handleL3Miss(miss)
-
-	default:
-		log.V(4).Infof("Ignoring not a miss: %v, %v", miss.HardwareAddr, miss.IP)
-	}
-}
-
-func (nw *network) handleL3Miss(miss *netlink.Neigh) {
-	route := nw.routes.findByNetwork(ip.FromIP(miss.IP))
-	if route == nil {
-		log.V(0).Infof("L3 miss but route for %v not found", miss.IP)
-		return
-	}
-
-	if err := nw.dev.AddL3(neighbor{IP: ip.FromIP(miss.IP), MAC: route.vtepMAC}); err != nil {
-		log.Errorf("AddL3 failed: %v", err)
-	} else {
-		log.V(2).Infof("L3 miss: AddL3 for %s succeeded", miss.IP)
-	}
 }

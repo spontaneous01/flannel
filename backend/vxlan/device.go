@@ -17,13 +17,10 @@ package vxlan
 import (
 	"fmt"
 	"net"
-	"os"
 	"syscall"
-	"time"
 
 	log "github.com/golang/glog"
 	"github.com/vishvananda/netlink"
-	"github.com/vishvananda/netlink/nl"
 
 	"github.com/coreos/flannel/pkg/ip"
 )
@@ -39,17 +36,6 @@ type vxlanDeviceAttrs struct {
 
 type vxlanDevice struct {
 	link *netlink.Vxlan
-}
-
-func sysctlSet(path, value string) error {
-	f, err := os.Create(path)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-
-	_, err = f.Write([]byte(value))
-	return err
 }
 
 func newVXLANDevice(devAttrs *vxlanDeviceAttrs) (*vxlanDevice, error) {
@@ -69,12 +55,6 @@ func newVXLANDevice(devAttrs *vxlanDeviceAttrs) (*vxlanDevice, error) {
 	if err != nil {
 		return nil, err
 	}
-	// this enables ARP requests being sent to userspace via netlink
-	sysctlPath := fmt.Sprintf("/proc/sys/net/ipv4/neigh/%s/app_solicit", devAttrs.name)
-	if err := sysctlSet(sysctlPath, "3"); err != nil {
-		return nil, err
-	}
-
 	return &vxlanDevice{
 		link: link,
 	}, nil
@@ -84,6 +64,7 @@ func ensureLink(vxlan *netlink.Vxlan) (*netlink.Vxlan, error) {
 	err := netlink.LinkAdd(vxlan)
 	if err == syscall.EEXIST {
 		// it's ok if the device already exists as long as config is similar
+		log.V(1).Infof("VXLAN device already exists")
 		existing, err := netlink.LinkByName(vxlan.Name)
 		if err != nil {
 			return nil, err
@@ -91,6 +72,7 @@ func ensureLink(vxlan *netlink.Vxlan) (*netlink.Vxlan, error) {
 
 		incompat := vxlanLinksIncompat(vxlan, existing)
 		if incompat == "" {
+			log.V(1).Infof("Returning existing device")
 			return existing.(*netlink.Vxlan), nil
 		}
 
@@ -144,6 +126,7 @@ func (dev *vxlanDevice) Configure(ipn ip.IP4Net) error {
 }
 
 func (dev *vxlanDevice) Destroy() {
+	log.V(1).Infof("Removing existing VXLAN device dev.link.Index: %d ", dev.link.Index)
 	netlink.LinkDel(dev.link)
 }
 
@@ -160,13 +143,23 @@ type neighbor struct {
 	IP  ip.IP4
 }
 
-func (dev *vxlanDevice) GetL2List() ([]netlink.Neigh, error) {
-	log.V(4).Infof("calling GetL2List() dev.link.Index: %d ", dev.link.Index)
+func (dev *vxlanDevice) GetFdbTable() ([]netlink.Neigh, error) {
+	log.V(4).Infof("calling GetFdbTable() dev.link.Index: %d ", dev.link.Index)
 	return netlink.NeighList(dev.link.Index, syscall.AF_BRIDGE)
 }
 
-func (dev *vxlanDevice) AddL2(n neighbor) error {
-	log.V(4).Infof("calling NeighAdd: %v, %v", n.IP, n.MAC)
+func (dev *vxlanDevice) GetArpTable() ([]netlink.Neigh, error) {
+	log.V(4).Infof("calling GetArpTable() dev.link.Index: %d ", dev.link.Index)
+	return netlink.NeighList(dev.link.Index, syscall.AF_INET)
+}
+
+func (dev *vxlanDevice) GetRouteTable() ([]netlink.Route, error) {
+	log.V(4).Infof("calling GetRouteTable() dev.link.Index: %d ", dev.link.Index)
+	return netlink.RouteList(dev.link, syscall.AF_INET)
+}
+
+func (dev *vxlanDevice) AddFdb(n neighbor) error {
+	log.V(4).Infof("calling AddFdb: %v, %v", n.IP, n.MAC)
 	return netlink.NeighAdd(&netlink.Neigh{
 		LinkIndex:    dev.link.Index,
 		State:        netlink.NUD_PERMANENT,
@@ -177,8 +170,8 @@ func (dev *vxlanDevice) AddL2(n neighbor) error {
 	})
 }
 
-func (dev *vxlanDevice) DelL2(n neighbor) error {
-	log.V(4).Infof("calling NeighDel: %v, %v", n.IP, n.MAC)
+func (dev *vxlanDevice) DelFdb(n neighbor) error {
+	log.V(4).Infof("calling DelFdb: %v, %v", n.IP, n.MAC)
 	return netlink.NeighDel(&netlink.Neigh{
 		LinkIndex:    dev.link.Index,
 		Family:       syscall.AF_BRIDGE,
@@ -188,75 +181,26 @@ func (dev *vxlanDevice) DelL2(n neighbor) error {
 	})
 }
 
-func (dev *vxlanDevice) AddL3(n neighbor) error {
-	log.V(4).Infof("calling NeighSet: %v, %v", n.IP, n.MAC)
+func (dev *vxlanDevice) AddArp(n neighbor) error {
+	log.V(4).Infof("calling AddArp: %v, %v", n.IP, n.MAC)
 	return netlink.NeighSet(&netlink.Neigh{
 		LinkIndex:    dev.link.Index,
-		State:        netlink.NUD_REACHABLE,
+		State:        netlink.NUD_PERMANENT,
 		Type:         syscall.RTN_UNICAST,
 		IP:           n.IP.ToIP(),
 		HardwareAddr: n.MAC,
 	})
 }
 
-func (dev *vxlanDevice) DelL3(n neighbor) error {
-	log.V(4).Infof("calling NeighDel: %v, %v", n.IP, n.MAC)
+func (dev *vxlanDevice) DelArp(n neighbor) error {
+	log.V(4).Infof("calling DelArp: %v, %v", n.IP, n.MAC)
 	return netlink.NeighDel(&netlink.Neigh{
 		LinkIndex:    dev.link.Index,
-		State:        netlink.NUD_REACHABLE,
+		State:        netlink.NUD_PERMANENT,
 		Type:         syscall.RTN_UNICAST,
 		IP:           n.IP.ToIP(),
 		HardwareAddr: n.MAC,
 	})
-}
-
-func (dev *vxlanDevice) MonitorMisses(misses chan *netlink.Neigh) {
-	nlsock, err := nl.Subscribe(syscall.NETLINK_ROUTE, syscall.RTNLGRP_NEIGH)
-	if err != nil {
-		log.Error("Failed to subscribe to netlink RTNLGRP_NEIGH messages")
-		return
-	}
-
-	for {
-		msgs, err := nlsock.Receive()
-		if err != nil {
-			log.Errorf("Failed to receive from netlink: %v ", err)
-
-			time.Sleep(1 * time.Second)
-			continue
-		}
-
-		for _, msg := range msgs {
-			dev.processNeighMsg(msg, misses)
-		}
-	}
-}
-
-func isNeighResolving(state int) bool {
-	return (state & (netlink.NUD_INCOMPLETE | netlink.NUD_STALE | netlink.NUD_DELAY | netlink.NUD_PROBE)) != 0
-}
-
-func (dev *vxlanDevice) processNeighMsg(msg syscall.NetlinkMessage, misses chan *netlink.Neigh) {
-	neigh, err := netlink.NeighDeserialize(msg.Data)
-	if err != nil {
-		log.Error("Failed to deserialize netlink ndmsg: %v", err)
-		return
-	}
-
-	if neigh.LinkIndex != dev.link.Index {
-		return
-	}
-
-	if msg.Header.Type != syscall.RTM_GETNEIGH && msg.Header.Type != syscall.RTM_NEWNEIGH {
-		return
-	}
-
-	if !isNeighResolving(neigh.State) {
-		// misses come with NUD_STALE bit set
-		return
-	}
-
-	misses <- neigh
 }
 
 func vxlanLinksIncompat(l1, l2 netlink.Link) string {
@@ -290,7 +234,6 @@ func vxlanLinksIncompat(l1, l2 netlink.Link) string {
 	if v1.Port > 0 && v2.Port > 0 && v1.Port != v2.Port {
 		return fmt.Sprintf("port: %v vs %v", v1.Port, v2.Port)
 	}
-
 	return ""
 }
 

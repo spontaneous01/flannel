@@ -111,11 +111,10 @@ func (be *VXLANBackend) RegisterNetwork(ctx context.Context, config *subnet.Conf
 		return nil, fmt.Errorf("failed to acquire lease: %v", err)
 	}
 
-	// vxlan's subnet is that of the whole overlay network (e.g. /16)
-	// and not that of the individual host (e.g. /24)
+	// vxlan's subnet is just that for this host
 	vxlanNet := ip.IP4Net{
 		IP:        lease.Subnet.IP,
-		PrefixLen: config.Network.PrefixLen,
+		PrefixLen: 32,
 	}
 	if err = dev.Configure(vxlanNet); err != nil {
 		return nil, err
