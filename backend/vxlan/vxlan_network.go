@@ -101,6 +101,7 @@ type vxlanLeaseAttrs struct {
 	VtepMAC hardwareAddr
 }
 
+//TODO I need to fix this up
 func (nw *network) handleSubnetEvents(batch []subnet.Event) {
 	for _, event := range batch {
 		switch event.Type {
@@ -158,6 +159,7 @@ func (nw *network) handleSubnetEvents(batch []subnet.Event) {
 	}
 }
 
+//TODO I need to fix this up
 func (nw *network) handleInitialSubnetEvents(batch []subnet.Event) error {
 	// The goal of this function is the ensure that the FDB (the mappings of VTEPs to public IPs) matches what's in
 	// the datastore.
